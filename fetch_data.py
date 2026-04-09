@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import stadata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -5,13 +6,22 @@ import re
 import time
 import datetime
 from google.cloud import bigquery
-from flask import Flask
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d")
 
-client = stadata.Client('262f8ec7c3d56fe547d7f843a9391a87')
+API_KEY = os.getenv("API_KEY")
+client = stadata.Client(API_KEY)
+bq_client = bigquery.Client()
 
-def fetch_and_transform(var_id):
+STOPWORDS = {
+	'di',
+	'menurut',
+	'dan',
+	'per',
+	'dengan'
+}
+
+def fetch_and_transform(var_id, meta_map):
 	try:
 		data = client.view_dynamictable(
 			domain='1507',
@@ -20,9 +30,9 @@ def fetch_and_transform(var_id):
 		)
 
 		if data is None or len(data) == 0:
-            print(f"[SKIP] var_id {var_id} empty")
+            print(f"[SKIP] {var_id}")
             return None
-
+			
 		# tambah metadata
 		data['var_id'] = var_id 
 		data['metric'] = meta_map[var_id]['metric']
@@ -52,14 +62,6 @@ def fetch_and_transform(var_id):
 		print(f"[ERROR] var_id{var_id}: {e}")
 		return None
 
-STOPWORDS = {
-	'di',
-	'menurut',
-	'dan',
-	'per',
-	'dengan'
-}
-
 def generate_metric(title, var_id):
 	title = title.lower()
 	title = re.sub(r'[^a-z0-9\s]', '', title)
@@ -69,30 +71,43 @@ def generate_metric(title, var_id):
 	metric = "_".join(words[:6])
 	return f"{metric}_{var_id}"
 
-client.list_dynamictable(all=False, domain=['1507'])
-df_meta = client.list_dynamictable(all=False, domain=['1507'])
-df_meta['metric'] = df_meta.apply(
-    lambda row: generate_metric(row['title'], row['var_id']),
-    axis=1
-)
-meta_map = df_meta.set_index('var_id')[['title', 'sub_name', 'unit', 'metric']].to_dict('index')
-var_ids = list(meta_map.keys())
+def run_pipeline():
+    # ambil metadata
+    df_meta = client.list_dynamictable(all=False, domain=['1507'])
 
-results = []
+    df_meta['metric'] = df_meta.apply(
+        lambda row: generate_metric(row['title'], row['var_id']),
+        axis=1
+    )
 
-MAX_WORKERS = 5
+    meta_map = df_meta.set_index('var_id')[['title','sub_name','unit','metric']].to_dict('index')
+    var_ids = list(meta_map.keys())
 
-with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-	futures = {executor.submit(fetch_and_transform, var_id): var_id for var_id in var_ids}
+    results = []
 
-	for future in as_completed(futures):
-		var_id = futures[future]
-		try:
-			result = future.result()
-			if result is not None:
-				results.append(result)
-		except Exception as e:
-			print(f"[FATAL] var_id {var_id}: {e}")
-	
-df_final = pd.concat(results, ignore_index=True)
-df_final.to_csv(f"data_{timestamp}.csv", index=False)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(fetch_and_transform, var_id, meta_map): var_id
+            for var_id in var_ids
+        }
+
+        for future in as_completed(futures):
+            res = future.result()
+            if res is not None:
+                results.append(res)
+
+    if not results:
+        print("No data fetched")
+        return "No data"
+
+    df_final = pd.concat(results, ignore_index=True)
+
+	# SAFE: replace table
+    job = bq_client.load_table_from_dataframe(df_final, PROD_TABLE)
+    job.result()
+
+	print("Loaded to production")
+	return "Success"
+
+if __name__ == "__main__":
+    run_pipeline()
