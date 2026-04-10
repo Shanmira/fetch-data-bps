@@ -3,75 +3,98 @@ import pandas as pd
 import stadata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
-import time
 import datetime
 from google.cloud import bigquery
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d")
 
 API_KEY = os.getenv("API_KEY")
+PROJECT_ID = os.getenv("PROJECT_ID")
+DATASET = os.getenv("DATASET")
+PROD_TABLE_NAME = os.getenv("PROD_TABLE")
+
+PROD_TABLE = f"{PROJECT_ID}.{DATASET}.{PROD_TABLE_NAME}"
+
 client = stadata.Client(API_KEY)
 bq_client = bigquery.Client()
 
 STOPWORDS = {
-	'di',
-	'menurut',
-	'dan',
-	'per',
-	'dengan'
+    'di',
+    'menurut',
+    'dan',
+    'per',
+    'dengan'
 }
 
-def fetch_and_transform(var_id, meta_map):
-	try:
-		data = client.view_dynamictable(
-			domain='1507',
-			var=var_id,
-			th='0,9'
-		)
 
-		if data is None or len(data) == 0:
+def fetch_and_transform(var_id, meta_map):
+    try:
+        data = client.view_dynamictable(
+            domain='1507',
+            var=var_id,
+            th='0,9'
+        )
+
+        if data is None or len(data) == 0:
             print(f"[SKIP] {var_id}")
             return None
-			
-		# tambah metadata
-		data['var_id'] = var_id 
-		data['metric'] = meta_map[var_id]['metric']
-		data['title'] = meta_map[var_id]['title']
-		data['sub_name'] = meta_map[var_id]['sub_name']
-		data['unit'] = meta_map[var_id]['unit']
 
-		# rename kolom
-		data = data.rename(columns={
-			'turunan variable': 'kategori'
-		})
+        # tambah metadata
+        data['var_id'] = var_id
+        data['metric'] = meta_map[var_id]['metric']
+        data['title'] = meta_map[var_id]['title']
+        data['sub_name'] = meta_map[var_id]['sub_name']
+        data['unit'] = meta_map[var_id]['unit']
 
-		year_cols = [col for col in data.columns if str(col).isdigit()]
+        # rename kolom
+        data = data.rename(columns={
+            'turunan variable': 'kategori'
+        })
 
-		# UNPIVOT data
-		df_long = data.melt(
-			id_vars=['var_id', 'metric', 'title', 'sub_name', 'unit', 'variable', 'kategori'],
-			value_vars=year_cols,
-			var_name='tahun',
-			value_name='value'
-		)
+        year_cols = [col for col in data.columns if str(col).isdigit()]
 
-		# adjust tahun buat jadi angka
-		df_long['tahun'] = df_long['tahun'].astype(int)
-		return df_long
-	except Exception as e:
-		print(f"[ERROR] var_id{var_id}: {e}")
-		return None
+        # UNPIVOT data
+        df_long = data.melt(
+            id_vars=['var_id', 'metric', 'title', 'sub_name', 'unit', 'variable', 'kategori'],
+            value_vars=year_cols,
+            var_name='tahun',
+            value_name='value'
+        )
+
+        # adjust tahun jadi angka
+        df_long['tahun'] = df_long['tahun'].astype(int)
+
+        return df_long
+
+    except Exception as e:
+        print(f"[ERROR] var_id {var_id}: {e}")
+        return None
+
 
 def generate_metric(title, var_id):
-	title = title.lower()
-	title = re.sub(r'[^a-z0-9\s]', '', title)
+    title = title.lower()
+    title = re.sub(r'[^a-z0-9\s]', '', title)
 
-	words = [w for w in title.split() if w not in STOPWORDS]
+    words = [w for w in title.split() if w not in STOPWORDS]
+    metric = "_".join(words[:6])
 
-	metric = "_".join(words[:6])
-	return f"{metric}_{var_id}"
+    return f"{metric}_{var_id}"
+
+def enforce_schema(df):
+    df['var_id'] = df['var_id'].astype(int)
+    df['metric'] = df['metric'].astype(str)
+    df['title'] = df['title'].astype(str)
+    df['sub_name'] = df['sub_name'].astype(str)
+    df['unit'] = df['unit'].astype(str)
+    df['variable'] = df['variable'].astype(str)
+    df['kategori'] = df['kategori'].astype(str)
+    df['tahun'] = df['tahun'].astype(int)
+    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+    return df
 
 def run_pipeline():
+    print("Starting pipeline...")
+
     # ambil metadata
     df_meta = client.list_dynamictable(all=False, domain=['1507'])
 
@@ -80,7 +103,7 @@ def run_pipeline():
         axis=1
     )
 
-    meta_map = df_meta.set_index('var_id')[['title','sub_name','unit','metric']].to_dict('index')
+    meta_map = df_meta.set_index('var_id')[['title', 'sub_name', 'unit', 'metric']].to_dict('index')
     var_ids = list(meta_map.keys())
 
     results = []
@@ -97,17 +120,22 @@ def run_pipeline():
                 results.append(res)
 
     if not results:
-        print("No data fetched")
+        print("No data fetched, skip upload")
         return "No data"
 
     df_final = pd.concat(results, ignore_index=True)
+	df_final = enforce_schema(df_final)
 
-	# SAFE: replace table
+    print(f"Total rows: {len(df_final)}")
+
+    # upload ke BigQuery
     job = bq_client.load_table_from_dataframe(df_final, PROD_TABLE)
     job.result()
 
-	print("Loaded to production")
-	return "Success"
+    print("Loaded to BigQuery")
+
+    return "Success"
+
 
 if __name__ == "__main__":
     run_pipeline()
