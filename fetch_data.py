@@ -6,15 +6,19 @@ import re
 import datetime
 from google.cloud import bigquery
 
+# timestamp (optional, kalau mau logging)
 timestamp = datetime.datetime.now().strftime("%Y%m%d")
 
+# ENV
 API_KEY = os.getenv("API_KEY")
 PROJECT_ID = os.getenv("PROJECT_ID")
 DATASET = os.getenv("DATASET")
 PROD_TABLE_NAME = os.getenv("PROD_TABLE")
 
+# FULL TABLE NAME
 PROD_TABLE = f"{PROJECT_ID}.{DATASET}.{PROD_TABLE_NAME}"
 
+# CLIENT
 client = stadata.Client(API_KEY)
 bq_client = bigquery.Client()
 
@@ -51,17 +55,25 @@ def fetch_and_transform(var_id, meta_map):
             'turunan variable': 'kategori'
         })
 
+        # ambil kolom tahun
         year_cols = [col for col in data.columns if str(col).isdigit()]
 
-        # UNPIVOT data
+        # unpivot
         df_long = data.melt(
-            id_vars=['var_id', 'metric', 'title', 'sub_name', 'unit', 'variable', 'kategori'],
+            id_vars=[
+                'var_id',
+                'metric',
+                'title',
+                'sub_name',
+                'unit',
+                'variable',
+                'kategori'
+            ],
             value_vars=year_cols,
             var_name='tahun',
             value_name='value'
         )
 
-        # adjust tahun jadi angka
         df_long['tahun'] = df_long['tahun'].astype(int)
 
         return df_long
@@ -80,6 +92,7 @@ def generate_metric(title, var_id):
 
     return f"{metric}_{var_id}"
 
+
 def enforce_schema(df):
     df['var_id'] = df['var_id'].astype(int)
     df['metric'] = df['metric'].astype(str)
@@ -92,6 +105,7 @@ def enforce_schema(df):
     df['value'] = pd.to_numeric(df['value'], errors='coerce')
     return df
 
+
 def run_pipeline():
     print("Starting pipeline...")
 
@@ -103,7 +117,10 @@ def run_pipeline():
         axis=1
     )
 
-    meta_map = df_meta.set_index('var_id')[['title', 'sub_name', 'unit', 'metric']].to_dict('index')
+    meta_map = df_meta.set_index('var_id')[
+        ['title', 'sub_name', 'unit', 'metric']
+    ].to_dict('index')
+
     var_ids = list(meta_map.keys())
 
     results = []
@@ -124,7 +141,7 @@ def run_pipeline():
         return "No data"
 
     df_final = pd.concat(results, ignore_index=True)
-	df_final = enforce_schema(df_final)
+    df_final = enforce_schema(df_final)
 
     print(f"Total rows: {len(df_final)}")
 
